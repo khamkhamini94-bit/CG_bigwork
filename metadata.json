@@ -1,0 +1,5 @@
+{
+  "name": "计算机图形学作业",
+  "description": "基于光线步进 (Ray Marching) 和 Henyey-Greenstein 相位函数的交互式 WebGL 体积光可视化。专为图形学编程参考设计。",
+  "requestFramePermissions": []
+}

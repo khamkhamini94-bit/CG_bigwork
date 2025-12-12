@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>体积光渲染实验室 (单文件版)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: "Microsoft YaHei", sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #fps {
+            position: absolute; top: 10px; left: 10px; 
+            color: #0f0; background: rgba(0,0,0,0.5); 
+            padding: 4px 8px; border-radius: 4px; pointer-events: none; user-select: none;
+            font-family: monospace;
+        }
+        /* 隐藏 dat.gui 关闭按钮，保持界面整洁 */
+        .dg .close-button { display: none; }
+    </style>
+    <!-- 引入 dat.GUI 用于参数调节 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@^19.2.3",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body>
+    <div id="fps">FPS: 0</div>
+    <canvas id="glcanvas"></canvas>
+
+    <script>
+        /**
+         * 体积光渲染实验室 (Volumetric Light Lab) - 单文件版
+         * 
+         * 核心功能:
+         * 1. 光线步进 (Ray Marching) - 场景与体积
+         * 2. Henyey-Greenstein 相位函数 - 模拟光线散射
+         * 3. 体积阴影 (Volumetric Shadows) - 产生光柱效果
+         * 4. 蓝噪声抖动 (Blue Noise Dithering) - 优化性能
+         */
+
+        // ==========================================
+        // 1. 着色器代码 (GLSL)
+        // ==========================================
+
+        const VERTEX_SHADER_SOURCE = `
+            attribute vec2 position;
+            varying vec2 vUv;
+            void main() {
+                vUv = position * 0.5 + 0.5;
+                gl_Position = vec4(position, 0.0, 1.0);
+            }
+        `;
+
+        const FRAGMENT_SHADER_SOURCE = `
+            precision highp float;
+
+            uniform vec2 uResolution;
+            uniform float uTime;
+            
+            // 交互 Uniforms
+            uniform vec2 uMouse; // 鼠标坐标用于旋转相机
+            
+            // 体积光参数 Uniforms
+            uniform float uDensity;       // 雾气密度
+            uniform float uScatteringG;   // 散射各向异性
+            uniform float uLightAngle;    // 光源角度
+            uniform float uSteps;         // 采样步数
+            uniform bool uDithering;      // 是否开启抖动
+            uniform float uShadowSoftness;// 阴影柔和度
+
+            varying vec2 vUv;
+
+            #define PI 3.14159265359
+            #define MAX_DIST 20.0
+
+            // --- 伪随机与噪声 (Pseudo-Random & Noise) ---
+            float random(vec2 st) {
+                return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+            }
+
+            // 交叉梯度噪声 (Interleaved Gradient Noise)
+            // 用于抖动采样起始位置，将低频条纹转化为高频噪点
+            float interleavedGradientNoise(vec2 uv) {
+                vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+                return fract(magic.z * fract(dot(uv, magic.xy)));
+            }
+
+            // --- SDFs (符号距离函数) ---
+            // 定义场景中的几何体
+            float sdBox(vec3 p, vec3 b) {
+                vec3 q = abs(p) - b;
+                return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+            }
+
+            float sdPlane(vec3 p, float h) {
+                return p.y - h;
+            }
+
+            // 场景地图函数 (Scene Map) - 描述整个世界
+            float map(vec3 p) {
+                // 悬浮的立方体
+                float box = sdBox(p - vec3(0.0, 1.0, 0.0), vec3(0.8, 1.2, 0.5));
+                // 地面
+                float plane = sdPlane(p, 0.0);
+                return min(box, plane);
+            }
+
+            // --- 光照与阴影核心算法 (Lighting & Shadow) ---
+
+            // Henyey-Greenstein 相位函数
+            // 决定光线在介质中散射的方向性
+            // g: 散射各向异性 (-1 到 1). 正值表示前向散射(产生强光束), 负值表示后向散射.
+            // cosTheta: 视线方向与光线传播方向的夹角余弦
+            float phaseHG(float g, float cosTheta) {
+                float g2 = g * g;
+                float num = 1.0 - g2;
+                float denom = 4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5);
+                return num / denom;
+            }
+
+            // 表面光线步进 (Surface Raymarching)
+            // 寻找视线与物体表面的交点
+            float rayMarch(vec3 ro, vec3 rd) {
+                float t = 0.0;
+                for(int i = 0; i < 100; i++) {
+                    vec3 p = ro + rd * t;
+                    float d = map(p);
+                    if(d < 0.001) break; // 击中物体
+                    t += d;
+                    if(t > MAX_DIST) break; // 超出最大距离
+                }
+                return t;
+            }
+
+            // 阴影计算 (Shadow Raymarching)
+            // 从当前点 p 向光源发射光线，检查是否有遮挡
+            float getShadow(vec3 p, vec3 lightPos) {
+                vec3 l = normalize(lightPos - p);
+                float distToLight = length(lightPos - p);
+                
+                float t = 0.1; // 偏移 bias 防止自我遮挡
+                float res = 1.0;
+                
+                for(int i = 0; i < 30; i++) {
+                    float h = map(p + l * t);
+                    // 软阴影逻辑: min(res, k * h / t)
+                    if( h < 0.001 ) return 0.0; // 完全在阴影中
+                    res = min( res, uShadowSoftness * h / t );
+                    t += h;
+                    if(t > distToLight) break;
+                }
+                return clamp(res, 0.0, 1.0);
+            }
+
+            void main() {
+                // 归一化屏幕坐标
+                vec2 uv = (gl_FragCoord.xy - 0.5 * uResolution.xy) / uResolution.y;
+                
+                // --- 交互式摄像机 (Interactive Camera) ---
+                // 基于 uMouse 旋转摄像机
+                float angleX = uMouse.x * 2.0 + 3.1415; // 水平旋转
+                float angleY = uMouse.y * 1.0 + 0.5;    // 垂直旋转
+                float radius = 4.5;
+
+                vec3 ro = vec3(
+                    sin(angleX) * radius * cos(angleY), 
+                    sin(angleY) * radius + 1.0, 
+                    cos(angleX) * radius * cos(angleY)
+                );
+                
+                vec3 lookAt = vec3(0.0, 1.0, 0.0);
+                float zoom = 1.0;
+                
+                // 构建相机矩阵
+                vec3 f = normalize(lookAt - ro);
+                vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f));
+                vec3 u = cross(f, r);
+                vec3 rd = normalize(f * zoom + r * uv.x + u * uv.y); // 射线方向
+
+                // 光源设置 (沿圆周移动的聚光灯)
+                vec3 lightPos = vec3(sin(uLightAngle) * 3.0, 4.0, cos(uLightAngle) * 3.0);
+                vec3 spotDir = normalize(vec3(0.0, 0.0, 0.0) - lightPos); // 聚光灯指向原点
+                vec3 lightColor = vec3(1.0, 0.9, 0.7) * 2.0;
+                float spotCutoff = 0.9; // 切光角的余弦值 (聚光灯范围)
+
+                // 1. 渲染场景表面 (Render Surface)
+                float t = rayMarch(ro, rd);
+                vec3 p = ro + rd * t;
+                vec3 col = vec3(0.0);
+                
+                // 如果光线击中了物体
+                if(t < MAX_DIST) {
+                    // 计算法线
+                    vec2 e = vec2(0.001, 0.0);
+                    vec3 n = normalize(vec3(
+                        map(p + e.xyy) - map(p - e.xyy),
+                        map(p + e.yxy) - map(p - e.yxy),
+                        map(p + e.yyx) - map(p - e.yyx)
+                    ));
+                    
+                    vec3 l = normalize(lightPos - p);
+                    
+                    // 漫反射 + 阴影
+                    float diff = max(dot(n, l), 0.0);
+                    float shadow = getShadow(p, lightPos);
+                    
+                    // 环境光 + 漫反射光
+                    col = vec3(0.05) + vec3(0.5) * diff * shadow * lightColor;
+                }
+
+                // 2. 体积光渲染 (Volumetric Rendering)
+                // 核心部分：在视线路径上进行累加
+                vec3 volCol = vec3(0.0);
+                
+                // 抖动采样 (Dithering)：随机化起始位置
+                float noise = uDithering ? interleavedGradientNoise(gl_FragCoord.xy) : 0.0;
+                
+                float tVol = 0.0;
+                // 我们只步进到表面击中点(t)或最大距离
+                float maxVolDist = (t < MAX_DIST) ? t : 8.0; 
+                
+                int steps = int(uSteps);
+                float stepSize = maxVolDist / float(steps);
+                
+                // 应用抖动偏移
+                tVol += stepSize * noise;
+
+                // 开始体积步进
+                for(int i = 0; i < 100; i++) {
+                    if(i >= steps) break;
+                    if(tVol >= maxVolDist) break;
+
+                    vec3 currP = ro + rd * tVol;
+
+                    // A. 聚光灯几何检测 (是否在光锥内?)
+                    vec3 toLight = lightPos - currP;
+                    float distToLightSq = dot(toLight, toLight);
+                    vec3 lDir = normalize(toLight);
+                    
+                    float spotEffect = dot(-lDir, spotDir);
+                    
+                    if(spotEffect > spotCutoff) {
+                        // 聚光灯边缘柔化
+                        float intensity = smoothstep(spotCutoff, spotCutoff + 0.05, spotEffect);
+                        
+                        // B. 阴影贴图/SDF查询 (关键：体积阴影)
+                        // 如果此点在阴影中，则不产生光散射 -> 形成光柱
+                        float shadow = getShadow(currP, lightPos);
+                        
+                        if(shadow > 0.01) {
+                            // C. 计算相位函数 (散射方向)
+                            float cosTheta = dot(rd, lDir); 
+                            float phase = phaseHG(uScatteringG, cosTheta);
+                            
+                            // D. 光照衰减 (模拟比尔定律)
+                            float atten = 1.0 / (1.0 + distToLightSq * 0.1);
+                            
+                            // 累加光能: 光色 * 阴影 * 聚光灯强度 * 相位 * 密度 * 衰减 * 步长
+                            volCol += lightColor * shadow * intensity * phase * uDensity * atten * stepSize;
+                        }
+                    }
+                    
+                    tVol += stepSize;
+                }
+
+                col += volCol;
+                
+                // 色调映射 (Tone mapping)
+                col = col / (col + vec3(1.0));
+                col = pow(col, vec3(1.0/2.2)); // Gamma 校正
+
+                gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+
+        // ==========================================
+        // 2. JavaScript 逻辑 (WebGL 设置)
+        // ==========================================
+
+        const canvas = document.getElementById('glcanvas');
+        const gl = canvas.getContext('webgl');
+        const fpsElement = document.getElementById('fps');
+
+        // --- 参数状态 (UI) ---
+        const params = {
+            lightAngle: 1.5,
+            density: 2.5,
+            scatteringG: 0.6,
+            steps: 64,
+            dithering: true,
+            shadowSoftness: 16.0,
+        };
+
+        // --- 鼠标状态 ---
+        const mouse = { x: 0, y: 0 };
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        // --- Shader 编译辅助函数 ---
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader 编译错误:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vsSource, fsSource) {
+            const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error('Program 链接错误:', gl.getProgramInfoLog(program));
+                return null;
+            }
+            return program;
+        }
+
+        // --- 初始化 ---
+        const program = createProgram(gl, VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE);
+        gl.useProgram(program);
+
+        // 创建全屏四边形缓冲
+        const vertexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+        const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
+        gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+        const positionLoc = gl.getAttribLocation(program, 'position');
+        gl.enableVertexAttribArray(positionLoc);
+        gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+        // 获取 Uniform 位置
+        const uLocs = {
+            resolution: gl.getUniformLocation(program, 'uResolution'),
+            time: gl.getUniformLocation(program, 'uTime'),
+            mouse: gl.getUniformLocation(program, 'uMouse'),
+            density: gl.getUniformLocation(program, 'uDensity'),
+            scatteringG: gl.getUniformLocation(program, 'uScatteringG'),
+            lightAngle: gl.getUniformLocation(program, 'uLightAngle'),
+            steps: gl.getUniformLocation(program, 'uSteps'),
+            dithering: gl.getUniformLocation(program, 'uDithering'),
+            shadowSoftness: gl.getUniformLocation(program, 'uShadowSoftness'),
+        };
+
+        // --- 初始化 GUI (中文) ---
+        const gui = new dat.GUI();
+        gui.domElement.parentElement.style.zIndex = "1000"; // 确保 GUI 在最上层
+
+        const folderParams = gui.addFolder('参数调节 (Parameters)');
+        folderParams.open();
+        
+        folderParams.add(params, 'lightAngle', 0, 6.28).name('光源角度 (Rad)');
+        folderParams.add(params, 'density', 0, 10).name('雾气密度');
+        folderParams.add(params, 'scatteringG', -0.9, 0.9).name('各向异性 (G)').onChange(() => console.log('正值=聚光, 负值=漫射'));
+        folderParams.add(params, 'steps', 5, 100).step(1).name('采样步数');
+        folderParams.add(params, 'shadowSoftness', 2.0, 64.0).name('阴影柔和度');
+        folderParams.add(params, 'dithering').name('抖动采样 (Dithering)');
+
+        // --- 鼠标交互事件 ---
+        canvas.addEventListener('mousedown', (e) => { isDragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; });
+        window.addEventListener('mouseup', () => { isDragging = false; });
+        window.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const deltaX = (e.clientX - lastMouseX) * 0.005;
+                const deltaY = (e.clientY - lastMouseY) * 0.005;
+                
+                mouse.x -= deltaX; // 旋转 Y 轴
+                mouse.y = Math.max(-1.0, Math.min(1.0, mouse.y + deltaY)); // 限制 Pitch 角度
+
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            }
+        });
+
+        // --- 渲染循环 ---
+        let startTime = performance.now();
+        let frameCount = 0;
+        let lastFpsTime = startTime;
+
+        function render() {
+            const now = performance.now();
+            const time = (now - startTime) / 1000;
+
+            // 计算 FPS
+            frameCount++;
+            if (now - lastFpsTime >= 1000) {
+                fpsElement.innerText = `FPS: ${Math.round((frameCount * 1000) / (now - lastFpsTime))}`;
+                frameCount = 0;
+                lastFpsTime = now;
+            }
+
+            // 处理窗口大小变化
+            if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
+                canvas.width = canvas.clientWidth;
+                canvas.height = canvas.clientHeight;
+                gl.viewport(0, 0, canvas.width, canvas.height);
+            }
+
+            // 传递 Uniforms
+            gl.uniform2f(uLocs.resolution, canvas.width, canvas.height);
+            gl.uniform1f(uLocs.time, time);
+            gl.uniform2f(uLocs.mouse, mouse.x, mouse.y);
+            
+            gl.uniform1f(uLocs.density, params.density);
+            gl.uniform1f(uLocs.scatteringG, params.scatteringG);
+            gl.uniform1f(uLocs.lightAngle, params.lightAngle);
+            gl.uniform1f(uLocs.steps, params.steps);
+            gl.uniform1i(uLocs.dithering, params.dithering ? 1 : 0);
+            gl.uniform1f(uLocs.shadowSoftness, params.shadowSoftness);
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            requestAnimationFrame(render);
+        }
+
+        render();
+    </script>
+<script type="module" src="/index.tsx"></script>
+</body>
+</html>
